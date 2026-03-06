@@ -1,0 +1,23 @@
+[project]
+name = "exif_renamer"
+version = "0.1.0"
+description = "Rename images/videos by EXIF or metadata creation time"
+readme = "README.md"
+requires-python = ">=3.8.1"
+dependencies = [
+    "ffmpeg-python>=0.2.0",
+    "pillow>=9.3.0",
+    "pillow-heif>=0.8.0",
+    "tqdm>=4.65",
+]
+
+[project.scripts]
+exif-renamer = "rename:main"
+
+[project.optional-dependencies]
+dev = [
+    "flake8>=6.0.0,<7.2.0",
+]
+
+[tool.uv]
+package = true
