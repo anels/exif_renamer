@@ -1,71 +1,73 @@
+import argparse
 import datetime
-import getopt
 import logging
 import os
+import shutil
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ffmpeg
 from PIL import Image
-from PIL.ExifTags import TAGS
 from pillow_heif import register_heif_opener
 from tqdm import tqdm
 
-image_extensions = [".jpg", ".jpeg", ".heic", ".cr2", ".png"]
-video_extensions = [".mp4", ".mov"]
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".heic", ".cr2", ".png"})
+VIDEO_EXTENSIONS = frozenset({".mp4", ".mov"})
+ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+
+DATE_FORMAT = "%Y-%m-%d %H.%M.%S"
 
 
-def get_video_creation_time(Filename):
-    video = ffmpeg.probe(Filename)["streams"]
+def _parse_creation_time(dt_str):
+    return datetime.datetime.fromisoformat(dt_str.rstrip("Z"))
 
-    def gt(dt_str):
-        dt, _, us = dt_str.partition(".")
-        dt = datetime.datetime.strptime(dt, "%Y-%m-%dT%H:%M:%S")
-        us = int(us.rstrip("Z"), 10)
-        return dt + datetime.timedelta(microseconds=us)
 
+def get_video_creation_time(file_path):
+    try:
+        streams = ffmpeg.probe(file_path)["streams"]
+    except Exception:
+        return None
     return next(
-        (gt(v["tags"]["creation_time"]) for v in video if "creation_time" in v["tags"]),
+        (
+            _parse_creation_time(v["tags"]["creation_time"])
+            for v in streams
+            if "tags" in v and "creation_time" in v["tags"]
+        ),
         None,
     )
 
 
-def get_image_exif_datetime(Filename, verbose):
+def get_image_exif_datetime(file_path, verbose):
     try:
-        with Image.open(Filename) as img:
-            exif_table = {}
-            for k, v in img.getexif().items():
-                tag = TAGS.get(k)
-                exif_table[tag] = v
-            if "DateTime" in exif_table:
-                dt = exif_table["DateTime"]
-                day, dtime = dt.split(" ", 1)
-                dd = day.replace(":", "-")
-                tt = dtime.replace(":", ".")
-                new_name = " ".join([dd, tt]).strip()
+        with Image.open(file_path) as img:
+            exif = img.getexif()
+            dt_str = exif.get(0x0132)  # DateTime
+            make = exif.get(0x010F)    # Make
+            model = exif.get(0x0110)   # Model
+
+            if dt_str:
+                dt_obj = datetime.datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+                new_name = dt_obj.strftime(DATE_FORMAT)
             else:
                 if verbose:
-                    logging.warning(
-                        f"    Cannot find datetime in exif. Available attributes: {exif_table}"
-                    )
+                    logging.warning(f"    Cannot find DateTime in EXIF for {file_path}")
                 new_name = None
-            make = exif_table.get("Make", None)
-            model = exif_table.get("Model", None)
+
             if new_name and make and model:
                 make = make.replace(" ", "_")
                 model = model.replace(" ", "_")
                 new_name += f" {make}_{model}"
             return new_name
     except Exception as e:
-        if verbose:
-            logging.error(f"    Something went wrong. Exception: {e}")
+        logging.warning(f"    Error reading EXIF from {file_path}: {e}")
         return None
 
 
-def get_file_fallback_time(Filename):
-    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(Filename))
-    ctime = datetime.datetime.fromtimestamp(os.path.getctime(Filename))
-    earliest_time = ctime if ctime < mtime else mtime
-    return earliest_time.strftime("%Y-%m-%d %H.%M.%S").strip()
+def get_file_fallback_time(file_path):
+    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(file_path))
+    ctime = datetime.datetime.fromtimestamp(os.path.getctime(file_path))
+    return min(ctime, mtime).strftime(DATE_FORMAT)
 
 
 def sanitize_filename(new_name):
@@ -80,37 +82,35 @@ def sanitize_filename(new_name):
     return new_name
 
 
-def scanDir(directory, verbose):
-    filelist = [
+def scan_dir(directory, verbose):
+    file_list = [
         f
         for f in os.listdir(directory)
-        if os.path.splitext(f)[1].lower() in (video_extensions + image_extensions)
+        if os.path.splitext(f)[1].lower() in ALL_EXTENSIONS
     ]
-    if not filelist:
+    if not file_list:
         return
-    register_heif_opener()
-    outputPath = os.path.join(directory, "renamed")
-    if not os.path.exists(outputPath):
-        os.makedirs(outputPath)
-    count = 0
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    output_path = os.path.join(directory, "renamed")
+    os.makedirs(output_path, exist_ok=True)
 
     log_lock = threading.Lock()
-    max_workers = min(os.cpu_count() or 1, 8)  # Use CPU count, default to 1 if None
+    claimed_names = set()
+    max_workers = min(os.cpu_count() or 1, 8)
     count = 0
     skipped = 0
     rename_history = []
 
-    def process_file(file, current_dir, output_path, log_lock, rename_history_list):
-        filename, extension = os.path.splitext(file)
-        source_path = os.path.join(current_dir, file)
+    def _extract_metadata(file):
+        """Extract new name from metadata; runs in thread pool."""
+        _, extension = os.path.splitext(file)
+        source_path = os.path.join(directory, file)
         new_name = None
-        if extension.lower() in video_extensions:
-            format_time = get_video_creation_time(source_path)
-            if format_time:
-                new_name = format_time.strftime("%Y-%m-%d %H.%M.%S").strip()
-        elif extension.lower() in image_extensions:
+        if extension.lower() in VIDEO_EXTENSIONS:
+            creation_time = get_video_creation_time(source_path)
+            if creation_time:
+                new_name = creation_time.strftime(DATE_FORMAT)
+        elif extension.lower() in IMAGE_EXTENSIONS:
             new_name = get_image_exif_datetime(source_path, verbose)
         if new_name:
             new_name = sanitize_filename(new_name)
@@ -118,35 +118,18 @@ def scanDir(directory, verbose):
             if verbose:
                 with log_lock:
                     logging.warning(
-                        f"    [{file}] Cannot get creation time from exif. Using file modification/creation time..."
+                        f"    [{file}] Cannot get creation time from exif. "
+                        "Using file modification/creation time..."
                     )
             new_name = get_file_fallback_time(source_path)
-        new_file = new_name + extension
-        if file != new_file:
-            dupCount = 0
-            dst = os.path.join(output_path, new_file)
-            while os.path.exists(dst):
-                dupCount += 1
-                dst = os.path.join(output_path, f"{new_name}-{dupCount}{extension}")
-            try:
-                os.rename(source_path, dst)
-            except OSError as e:
-                with log_lock:
-                    logging.error(f"    Error renaming {file} to {os.path.basename(dst)}: {e}")
-                return 0 # Indicate failure/skip
-            entry = f"{file} => {os.path.basename(dst)}"
-            with log_lock:
-                rename_history_list.append(entry)
-            return 1
-        else:
-            return 0
+        return file, new_name, extension
 
+    # Phase 1: extract metadata in parallel
+    metadata_results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Pass necessary context to each worker
-        futures = {executor.submit(process_file, file, directory, outputPath, log_lock, rename_history): file for file in filelist}
-
+        futures = {executor.submit(_extract_metadata, f): f for f in file_list}
         with tqdm(
-            total=len(filelist),
+            total=len(file_list),
             desc="Processing",
             ascii=True,
             unit="file",
@@ -154,52 +137,53 @@ def scanDir(directory, verbose):
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
         ) as pbar:
             for future in as_completed(futures):
-                original_file = futures[future]
                 try:
-                    result = future.result()
-                    if result == 1:
-                        count += 1
-                    else:
-                        # Skipped either because name didn't change or due to rename error
-                        skipped += 1
+                    metadata_results.append(future.result())
                 except Exception as e:
-                    skipped += 1 # Count exceptions as skipped
+                    skipped += 1
                     with log_lock:
-                        logging.error(f"    Error processing file {original_file}: {e}")
+                        logging.error(f"    Error processing {futures[future]}: {e}")
                 finally:
-                    pbar.update(1) # Ensure progress bar updates even on error
+                    pbar.update(1)
 
-    # Log results after processing all files
+    # Phase 2: rename sequentially to avoid TOCTOU races
+    for file, new_name, extension in metadata_results:
+        new_file = new_name + extension
+        if file == new_file:
+            skipped += 1
+            continue
+        dup_count = 0
+        dst = os.path.join(output_path, new_file)
+        while os.path.exists(dst) or dst in claimed_names:
+            dup_count += 1
+            dst = os.path.join(output_path, f"{new_name}-{dup_count}{extension}")
+        claimed_names.add(dst)
+        source_path = os.path.join(directory, file)
+        try:
+            shutil.move(source_path, dst)
+        except OSError as e:
+            logging.error(f"    Error renaming {file} to {os.path.basename(dst)}: {e}")
+            skipped += 1
+            continue
+        rename_history.append((file, os.path.basename(dst)))
+        count += 1
+
     if rename_history:
         logging.info("\nRename History:")
-        max_len = max(len(entry.split('=>')[0].strip()) for entry in rename_history) if rename_history else 0
-        for entry in rename_history:
-            original, renamed = entry.split('=>')
-            logging.info(f"    {original.strip():<{max_len}} => {renamed.strip()}")
+        max_len = max(len(orig) for orig, _ in rename_history)
+        for orig, renamed in rename_history:
+            logging.info(f"    {orig:<{max_len}} => {renamed}")
     else:
         logging.info("\nNo files needed renaming in this directory.")
     logging.info(f"\nFinished processing {directory}. Renamed: {count}, Skipped/Errors: {skipped}")
-
-
-import argparse
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Rename image and video files based on EXIF/metadata creation time."
     )
-    parser.add_argument(
-        "-p",
-        "--path",
-        required=True,
-        help="Directory path to scan for files.",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging for debugging.",
-    )
+    parser.add_argument("-p", "--path", required=True, help="Directory path to scan for files.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging for debugging.")
     args = parser.parse_args()
 
     path = args.path
@@ -211,11 +195,9 @@ def main():
 
     current_ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     log_file_name = f"rename_{current_ts}.log"
-    # Place log file in the script's directory or a dedicated logs folder if preferred
     log_file_path = os.path.join(os.path.dirname(__file__) or '.', log_file_name)
 
     log_level = logging.DEBUG if verbose else logging.INFO
-    # Ensure stdout/stderr use UTF-8 on Windows consoles to avoid cp1252 errors
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -227,30 +209,28 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.FileHandler(log_file_path, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout)
+            logging.StreamHandler(sys.stdout),
         ],
-        force=True
+        force=True,
     )
 
     logging.info(f"Starting scan in directory: {path}")
     logging.info(f"Log file: {log_file_path}")
 
-    # Walk through directory, skipping the 'renamed' subdirectory
+    register_heif_opener()
+
     for root, dirs, files in os.walk(path, topdown=True):
-        # Prevent recursion into the 'renamed' directory
         if 'renamed' in dirs:
             dirs.remove('renamed')
-
-        # Skip the root 'renamed' directory if it exists at the top level
         if os.path.basename(root) == 'renamed' and os.path.dirname(root) == path:
-             continue
-
+            continue
         logging.info(f"Scanning {root}...")
-        scanDir(root, verbose)
+        scan_dir(root, verbose)
         logging.info(f"Finished scanning {root}.")
-        logging.info("") # Add a blank line for readability
+        logging.info("")
 
     logging.info("Scan complete.")
+
 
 if __name__ == "__main__":
     main()
