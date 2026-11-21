@@ -8,7 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ffmpeg
-from PIL import Image
+from PIL import ExifTags, Image
 from pillow_heif import register_heif_opener
 from tqdm import tqdm
 
@@ -20,7 +20,12 @@ DATE_FORMAT = "%Y-%m-%d %H.%M.%S"
 
 
 def _parse_creation_time(dt_str):
-    return datetime.datetime.fromisoformat(dt_str.rstrip("Z"))
+    dt = datetime.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        # ffmpeg reports creation_time in UTC; convert to local time so video
+        # filenames line up with the local-time EXIF stamps used for photos.
+        dt = dt.astimezone()
+    return dt
 
 
 def get_video_creation_time(file_path):
@@ -42,7 +47,13 @@ def get_image_exif_datetime(file_path, verbose):
     try:
         with Image.open(file_path) as img:
             exif = img.getexif()
-            dt_str = exif.get(0x0132)  # DateTime
+            try:
+                exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+            except Exception:
+                exif_ifd = {}
+            # Prefer DateTimeOriginal (the capture time); DateTime (0x0132) is
+            # the file change time and moves whenever the image is re-saved.
+            dt_str = exif_ifd.get(0x9003) or exif.get(0x0132)
             make = exif.get(0x010F)    # Make
             model = exif.get(0x0110)   # Model
 
@@ -51,7 +62,7 @@ def get_image_exif_datetime(file_path, verbose):
                 new_name = dt_obj.strftime(DATE_FORMAT)
             else:
                 if verbose:
-                    logging.warning(f"    Cannot find DateTime in EXIF for {file_path}")
+                    logging.warning(f"    Cannot find capture time in EXIF for {file_path}")
                 new_name = None
 
             if new_name and make and model:
