@@ -54,6 +54,11 @@ def get_image_exif_datetime(file_path, verbose):
             # Prefer DateTimeOriginal (the capture time); DateTime (0x0132) is
             # the file change time and moves whenever the image is re-saved.
             dt_str = exif_ifd.get(0x9003) or exif.get(0x0132)
+            if dt_str:
+                # EXIF strings can carry trailing null bytes or whitespace;
+                # strip so strptime does not throw and silently drop the
+                # file to the file-time fallback.
+                dt_str = dt_str.strip()
             make = exif.get(0x010F)    # Make
             model = exif.get(0x0110)   # Model
 
