@@ -58,7 +58,7 @@ def get_image_exif_datetime(file_path, verbose):
                 # EXIF strings can carry trailing null bytes or whitespace;
                 # strip so strptime does not throw and silently drop the
                 # file to the file-time fallback.
-                dt_str = dt_str.strip()
+                dt_str = dt_str.strip().strip("\x00")
             make = exif.get(0x010F)    # Make
             model = exif.get(0x0110)   # Model
 

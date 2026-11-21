@@ -90,3 +90,12 @@ python .\rename.py -p 'D:\OneDrive\Pictures\Camera Roll\2022'
 ```bash
 python rename.py -p "./test_photos" -v
 ```
+
+## Timezone caveat
+
+Video `creation_time` values are converted to the local timezone
+with `astimezone()`, which uses the timezone of the machine running
+the rename. A video shot in another timezone is therefore named in
+the processing machine's zone, not the shooting zone. Fine for a
+personal library processed on one machine; noted here so it is a
+conscious choice.
