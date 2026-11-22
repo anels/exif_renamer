@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-exif-renamer = "rename:main"
+exif-renamer = "exif_renamer:main"
 
 [project.optional-dependencies]
 dev = [
@@ -21,3 +21,6 @@ dev = [
 
 [tool.uv]
 package = true
+
+[tool.setuptools]
+py-modules = ["exif_renamer"]

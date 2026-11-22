@@ -4,13 +4,13 @@ import logging
 import os
 import shutil
 import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ffmpeg
 from PIL import ExifTags, Image
 from pillow_heif import register_heif_opener
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".heic", ".cr2", ".png"})
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov"})
@@ -110,12 +110,9 @@ def scan_dir(directory, verbose):
     output_path = os.path.join(directory, "renamed")
     os.makedirs(output_path, exist_ok=True)
 
-    log_lock = threading.Lock()
-    claimed_names = set()
     max_workers = min(os.cpu_count() or 1, 8)
     count = 0
     skipped = 0
-    rename_history = []
 
     def _extract_metadata(file):
         """Extract new name from metadata; runs in thread pool."""
@@ -132,17 +129,16 @@ def scan_dir(directory, verbose):
             new_name = sanitize_filename(new_name)
         else:
             if verbose:
-                with log_lock:
-                    logging.warning(
-                        f"    [{file}] Cannot get creation time from exif. "
-                        "Using file modification/creation time..."
-                    )
+                logging.warning(
+                    f"    [{file}] Cannot get creation time from exif. "
+                    "Using file modification/creation time..."
+                )
             new_name = get_file_fallback_time(source_path)
         return file, new_name, extension
 
     # Phase 1: extract metadata in parallel
     metadata_results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with logging_redirect_tqdm(), ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_extract_metadata, f): f for f in file_list}
         with tqdm(
             total=len(file_list),
@@ -157,23 +153,23 @@ def scan_dir(directory, verbose):
                     metadata_results.append(future.result())
                 except Exception as e:
                     skipped += 1
-                    with log_lock:
-                        logging.error(f"    Error processing {futures[future]}: {e}")
+                    logging.error(f"    Error processing {futures[future]}: {e}")
                 finally:
                     pbar.update(1)
 
-    # Phase 2: rename sequentially to avoid TOCTOU races
-    for file, new_name, extension in metadata_results:
+    # Phase 2: rename sequentially to avoid TOCTOU races. Sort by original
+    # name so files sharing a timestamp get their -N suffixes in a stable
+    # order instead of thread-completion order.
+    for file, new_name, extension in sorted(metadata_results):
         new_file = new_name + extension
         if file == new_file:
             skipped += 1
             continue
         dup_count = 0
         dst = os.path.join(output_path, new_file)
-        while os.path.exists(dst) or dst in claimed_names:
+        while os.path.exists(dst):
             dup_count += 1
             dst = os.path.join(output_path, f"{new_name}-{dup_count}{extension}")
-        claimed_names.add(dst)
         source_path = os.path.join(directory, file)
         try:
             shutil.move(source_path, dst)
@@ -181,15 +177,12 @@ def scan_dir(directory, verbose):
             logging.error(f"    Error renaming {file} to {os.path.basename(dst)}: {e}")
             skipped += 1
             continue
-        rename_history.append((file, os.path.basename(dst)))
+        # Log each move as it happens: the log is the only record of the
+        # original names if the run is interrupted.
+        logging.info(f"    {file} => {os.path.basename(dst)}")
         count += 1
 
-    if rename_history:
-        logging.info("\nRename History:")
-        max_len = max(len(orig) for orig, _ in rename_history)
-        for orig, renamed in rename_history:
-            logging.info(f"    {orig:<{max_len}} => {renamed}")
-    else:
+    if not count:
         logging.info("\nNo files needed renaming in this directory.")
     logging.info(f"\nFinished processing {directory}. Renamed: {count}, Skipped/Errors: {skipped}")
 
@@ -238,8 +231,6 @@ def main():
     for root, dirs, files in os.walk(path, topdown=True):
         if 'renamed' in dirs:
             dirs.remove('renamed')
-        if os.path.basename(root) == 'renamed' and os.path.dirname(root) == path:
-            continue
         logging.info(f"Scanning {root}...")
         scan_dir(root, verbose)
         logging.info(f"Finished scanning {root}.")
